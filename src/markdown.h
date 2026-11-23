@@ -261,34 +261,41 @@ static Str resolve_md_link(MdEnv *env, Str target, char *tmp_buf) {
 
 // ---- Fast inline delimiter searchers ----
 static inline int32_t find_unescaped_2star(const char *s, uint32_t len, uint32_t from) {
-    for (uint32_t j = from; j + 1 < len; j++) {
-        uint8_t c = (uint8_t)s[j];
-        if (c == '*') {
+    uint32_t j = from;
+    while (j + 1 < len) {
+        while (j + 1 < len && s[j] != '*' && s[j] != '\\') j++;
+        if (j + 1 >= len) break;
+        if (s[j] == '*') {
             if (s[j + 1] == '*') return (int32_t)j;
-        } else if (c == '\\') {
-            if (is_md_escapable((uint8_t)s[j + 1])) j++;
+            j++;
+        } else {
+            j += is_md_escapable((uint8_t)s[j + 1]) ? 2 : 1;
         }
     }
     return -1;
 }
 
 static inline int32_t find_unescaped_rbracket(const char *s, uint32_t len, uint32_t from) {
-    for (uint32_t j = from; j < len; j++) {
-        uint8_t c = (uint8_t)s[j];
-        if (c == ']') return (int32_t)j;
-        if (c == '\\' && j + 1 < len && is_md_escapable((uint8_t)s[j + 1])) j++;
+    uint32_t j = from;
+    while (j < len) {
+        while (j < len && s[j] != ']' && s[j] != '\\') j++;
+        if (j >= len) break;
+        if (s[j] == ']') return (int32_t)j;
+        j += (j + 1 < len && is_md_escapable((uint8_t)s[j + 1])) ? 2 : 1;
     }
     return -1;
 }
 
 static inline int32_t find_single_star(const char *s, uint32_t len, uint32_t from) {
-    for (uint32_t j = from; j < len; j++) {
-        uint8_t c = (uint8_t)s[j];
-        if (c == '*') {
-            if (j + 1 < len && s[j + 1] == '*') { j++; continue; }
+    uint32_t j = from;
+    while (j < len) {
+        while (j < len && s[j] != '*' && s[j] != '\\') j++;
+        if (j >= len) break;
+        if (s[j] == '*') {
+            if (j + 1 < len && s[j + 1] == '*') { j += 2; continue; }
             return (int32_t)j;
         }
-        if (c == '\\' && j + 1 < len && is_md_escapable((uint8_t)s[j + 1])) j++;
+        j += (j + 1 < len && is_md_escapable((uint8_t)s[j + 1])) ? 2 : 1;
     }
     return -1;
 }
@@ -541,6 +548,157 @@ static void md_emit_inline(Buf *out, const char *s, uint32_t len, MdEnv *env) {
     out->len = (size_t)(dst - out->data);
 }
 #elif defined(__x86_64__)
+static void md_emit_inline_avx2(Buf *out, const char *s, uint32_t len, MdEnv *env);
+
+// Fully AVX2-compiled inline delimiter handler -> ZERO vzeroupper & ZERO YMM reloads across all *, **, `, \ delimiters!
+__attribute__((target("avx2")))
+static inline void md_emit_inner_fast_avx2(Buf *out, char **dst_io, const char *s, uint32_t len, MdEnv *env) {
+    char *dst = *dst_io;
+    const int dj = env->direct_json;
+    if (len < 32) {
+        for (uint32_t k = 0; k < len; k++) {
+            uint8_t c = (uint8_t)s[k];
+            uint8_t cls = MD_SPEC_LUT[c];
+            if (__builtin_expect(cls == 0, 1)) {
+                *dst++ = (char)c;
+            } else if (cls == 1) {
+                MD_EMIT_PLAIN_SPECIAL(dst, c, dj);
+            } else {
+                out->len = (size_t)(dst - out->data);
+                md_emit_inline_avx2(out, s + k, len - k, env);
+                *dst_io = out->data + out->len;
+                return;
+            }
+        }
+        *dst_io = dst;
+        return;
+    }
+    out->len = (size_t)(dst - out->data);
+    md_emit_inline_avx2(out, s, len, env);
+    *dst_io = out->data + out->len;
+}
+
+__attribute__((target("avx2")))
+static uint32_t md_handle_delim_avx2(Buf *out, char **dst_io, const char *s, uint32_t len, uint32_t i, MdEnv *env,
+                                     uint8_t *no_bt, uint8_t *no_2s, uint8_t *no_1s, uint8_t *no_rb) {
+    char *dst = *dst_io;
+    const int dj = env->direct_json;
+    uint8_t c = (uint8_t)s[i];
+
+    if (c == '\\') {
+        if (i + 1 < len && is_md_escapable((uint8_t)s[i + 1])) {
+            uint8_t nc = (uint8_t)s[i + 1];
+            if (nc == '>') { COPY_LE32(dst, "&gt;", 4); dst += 4; }
+            else if (nc == '\\') { if (dj) { dst[0] = '\\'; dst[1] = '\\'; dst += 2; } else *dst++ = '\\'; }
+            else *dst++ = (char)nc;
+            *dst_io = dst;
+            return i + 2;
+        }
+        if (dj) { dst[0] = '\\'; dst[1] = '\\'; dst += 2; } else *dst++ = '\\';
+        *dst_io = dst;
+        return i + 1;
+    }
+    if (c == '`') {
+        if (!*no_bt) {
+            uint32_t j = i + 1;
+            while (j < len && s[j] != '`') j++;
+            if (j < len && j > i + 1) {
+                COPY_LE32(dst, "<code>", 6); dst += 6;
+                uint32_t clen = j - (i + 1);
+                if (clen < 24 && dj) {
+                    const char *cs = s + i + 1;
+                    for (uint32_t k = 0; k < clen; k++) {
+                        uint8_t cc = (uint8_t)cs[k];
+                        if (__builtin_expect(MD_SPEC_LUT[cc] == 0 || cc == '*' || cc == '[' || cc == '`', 1)) {
+                            *dst++ = (char)cc;
+                        } else {
+                            EMIT_HTML_JSON_CHAR(dst, cc);
+                        }
+                    }
+                } else {
+                    out->len = (size_t)(dst - out->data);
+                    if (dj) buf_append_html_json_avx2(out, s + i + 1, clen);
+                    else buf_append_html_raw_escaped(out, s + i + 1, clen);
+                    dst = out->data + out->len;
+                }
+                COPY_LE32(dst, "</code>", 7); dst += 7;
+                *dst_io = dst;
+                return j + 1;
+            }
+            if (j >= len) *no_bt = 1;
+        }
+        *dst++ = '`';
+        *dst_io = dst;
+        return i + 1;
+    }
+    if (c == '*') {
+        if (i + 1 < len && s[i + 1] == '*') {
+            if (!*no_2s) {
+                int32_t j = find_unescaped_2star(s, len, i + 2);
+                if (j > (int32_t)(i + 2)) {
+                    COPY_LE32(dst, "<strong>", 8); dst += 8;
+                    md_emit_inner_fast_avx2(out, &dst, s + i + 2, (uint32_t)j - (i + 2), env);
+                    COPY_LE32(dst, "</strong>", 9); dst += 9;
+                    *dst_io = dst;
+                    return (uint32_t)j + 2;
+                }
+                if (j < 0) *no_2s = 1;
+            }
+            dst[0] = '*'; dst[1] = '*'; dst += 2;
+            *dst_io = dst;
+            return i + 2;
+        }
+        if (!*no_1s) {
+            int32_t j = find_single_star(s, len, i + 1);
+            if (j > (int32_t)(i + 1)) {
+                COPY_LE32(dst, "<em>", 4); dst += 4;
+                md_emit_inner_fast_avx2(out, &dst, s + i + 1, (uint32_t)j - (i + 1), env);
+                COPY_LE32(dst, "</em>", 5); dst += 5;
+                *dst_io = dst;
+                return (uint32_t)j + 1;
+            }
+            if (j < 0) *no_1s = 1;
+        }
+        *dst++ = '*';
+        *dst_io = dst;
+        return i + 1;
+    }
+    // c == '['
+    if (!*no_rb) {
+        int32_t k = find_unescaped_rbracket(s, len, i + 1);
+        if (k < 0) {
+            *no_rb = 1;
+        } else if ((uint32_t)(k + 1) < len && s[k + 1] == '(') {
+            int32_t m = -1;
+            for (uint32_t u = (uint32_t)(k + 2); u < len; u++) {
+                if (s[u] == ')') { m = (int32_t)u; break; }
+            }
+            if (m > k + 2) {
+                Str target = { s + k + 2, (uint32_t)(m - (k + 2)) };
+                if (!has_js_ws(target.p, target.len)) {
+                    if (dj) { COPY_LE32(dst, "<a href=\\\"", 10); dst += 10; }
+                    else    { COPY_LE32(dst, "<a href=\"", 9); dst += 9; }
+                    char lbuf[1024];
+                    Str href = resolve_md_link(env, target, lbuf);
+                    out->len = (size_t)(dst - out->data);
+                    if (dj) buf_append_html_json_avx2(out, href.p, href.len);
+                    else buf_append_html_raw_escaped(out, href.p, href.len);
+                    dst = out->data + out->len;
+                    if (dj) { COPY_LE32(dst, "\\\">", 3); dst += 3; }
+                    else    { COPY_LE32(dst, "\">", 2); dst += 2; }
+                    md_emit_inner_fast_avx2(out, &dst, s + i + 1, (uint32_t)k - (i + 1), env);
+                    COPY_LE32(dst, "</a>", 4); dst += 4;
+                    *dst_io = dst;
+                    return (uint32_t)m + 1;
+                }
+            }
+        }
+    }
+    *dst++ = '[';
+    *dst_io = dst;
+    return i + 1;
+}
+
 __attribute__((target("avx2")))
 static void md_emit_inline_avx2(Buf *out, const char *s, uint32_t len, MdEnv *env) {
     __m256i vlo = _mm256_setr_epi8(17,1,3,1, 1,1,3,3, 1,1,3,9, 13,1,5,1,  17,1,3,1, 1,1,3,3, 1,1,3,9, 13,1,5,1);
@@ -566,7 +724,7 @@ static void md_emit_inline_avx2(Buf *out, const char *s, uint32_t len, MdEnv *en
             dst += (pos - prev);
             uint8_t c = blk[pos];
             if (MD_SPEC_LUT[c] == 2) {
-                i = md_handle_delim(out, &dst, s, len, i + pos, env, &no_bt, &no_2s, &no_1s, &no_rb);
+                i = md_handle_delim_avx2(out, &dst, s, len, i + pos, env, &no_bt, &no_2s, &no_1s, &no_rb);
                 goto next_chunk_avx2;
             }
             MD_EMIT_PLAIN_SPECIAL(dst, c, dj);
@@ -582,7 +740,7 @@ static void md_emit_inline_avx2(Buf *out, const char *s, uint32_t len, MdEnv *en
         uint8_t cls = MD_SPEC_LUT[c];
         if (__builtin_expect(cls == 0, 1)) { *dst++ = (char)c; i++; }
         else if (cls == 1) { MD_EMIT_PLAIN_SPECIAL(dst, c, dj); i++; }
-        else { i = md_handle_delim(out, &dst, s, len, i, env, &no_bt, &no_2s, &no_1s, &no_rb); }
+        else { i = md_handle_delim_avx2(out, &dst, s, len, i, env, &no_bt, &no_2s, &no_1s, &no_rb); }
     }
     out->len = (size_t)(dst - out->data);
 }

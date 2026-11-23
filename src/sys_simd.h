@@ -276,7 +276,7 @@ static inline void buf_flush(Buf *b) {
 }
 
 static inline void buf_maybe_flush(Buf *b) {
-    if (b->fd >= 0 && b->len >= (1536ULL << 10)) buf_flush(b);
+    if (b->fd >= 0 && b->len >= (256ULL << 10)) buf_flush(b);
 }
 
 static __attribute__((always_inline)) inline void buf_put(Buf *b, char c) {
@@ -622,33 +622,44 @@ static void buf_append_json_escaped(Buf *b, const char *s, size_t len) {
     b->len = (size_t)(dst - b->data);
 }
 
-// Ultra-fast NEON word counter: 1-instruction ASCII check + exact UTF-8 whitespace guard!
+// Ultra-fast batched NEON word counter: zero per-16B horizontal reductions!
 static int64_t count_words_fast_simd(const uint8_t *p, size_t len) {
     uint8x16_t vsp = vdupq_n_u8(' ');
     uint8x16_t v09 = vdupq_n_u8(0x09);
     uint8x16_t v04 = vdupq_n_u8(0x04);
-    uint8x16_t v01 = vdupq_n_u8(1);
     uint64_t total = 0;
     uint8_t prev_ws = 0xFF;
     const uint8_t *end = p + len;
     while (p + 16 <= end) {
-        uint8x16_t v = vld1q_u8(p);
-        if (__builtin_expect(vmaxvq_u8(v) >= 0xC2, 0)) {
-            for (int k = 0; k < 16; k++) {
-                uint8_t c = p[k];
-                if (c == 0xC2 && p + k + 1 < end && p[k + 1] == 0xA0) return -1;
-                if (c == 0xE1 && p + k + 2 < end && p[k + 1] == 0x9A && p[k + 2] == 0x80) return -1;
-                if (c == 0xE2 && p + k + 2 < end && (p[k + 1] == 0x80 || p[k + 1] == 0x81)) return -1;
-                if (c == 0xE3 && p + k + 2 < end && p[k + 1] == 0x80 && p[k + 2] == 0x80) return -1;
-                if (c == 0xEF && p + k + 2 < end && p[k + 1] == 0xBB && p[k + 2] == 0xBF) return -1;
+        const uint8_t *batch_start = p;
+        size_t chunks = (size_t)(end - p) >> 4;
+        if (chunks > 240) chunks = 240;
+        uint8x16_t acc = vdupq_n_u8(0);
+        uint8x16_t hi_or = vdupq_n_u8(0);
+        uint8x16_t prev_v = vdupq_n_u8(prev_ws);
+        for (size_t k = 0; k < chunks; k++) {
+            uint8x16_t v = vld1q_u8(p);
+            hi_or = vorrq_u8(hi_or, v);
+            uint8x16_t ws = vorrq_u8(vceqq_u8(v, vsp), vcleq_u8(vsubq_u8(v, v09), v04));
+            uint8x16_t prev = vextq_u8(prev_v, ws, 15);
+            acc = vsubq_u8(acc, vbicq_u8(prev, ws)); // starts is 0xFF => -0xFF == +1!
+            prev_v = ws;
+            p += 16;
+        }
+        if (__builtin_expect(vmaxvq_u8(hi_or) >= 0x80, 0)) {
+            for (const uint8_t *q = batch_start; q < p; q++) {
+                uint8_t c = *q;
+                if (__builtin_expect(c >= 0xC2, 0)) {
+                    if (c == 0xC2 && q + 1 < end && q[1] == 0xA0) return -1;
+                    if (c == 0xE1 && q + 2 < end && q[1] == 0x9A && q[2] == 0x80) return -1;
+                    if (c == 0xE2 && q + 2 < end && (q[1] == 0x80 || q[1] == 0x81)) return -1;
+                    if (c == 0xE3 && q + 2 < end && q[1] == 0x80 && q[2] == 0x80) return -1;
+                    if (c == 0xEF && q + 2 < end && q[1] == 0xBB && q[2] == 0xBF) return -1;
+                }
             }
         }
-        uint8x16_t ws = vorrq_u8(vceqq_u8(v, vsp), vcleq_u8(vsubq_u8(v, v09), v04));
-        uint8x16_t prev = vextq_u8(vdupq_n_u8(prev_ws), ws, 15);
-        uint8x16_t starts = vbicq_u8(prev, ws);
-        total += vaddvq_u8(vandq_u8(starts, v01));
-        prev_ws = vgetq_lane_u8(ws, 15);
-        p += 16;
+        total += vaddlvq_u8(acc);
+        prev_ws = vgetq_lane_u8(prev_v, 15);
     }
     int in_word = (prev_ws == 0);
     while (p < end) {

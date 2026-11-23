@@ -330,11 +330,11 @@ static void build_case(Arena *a, CaseInput *ci, Buf *out, Buf *md_html_buf, Buf 
     }
 
     // 5. Reading minutes (Markdown rendering deferred to streaming per-page pass for L1 cache & minimal page faults!)
-    uint32_t broken_cap = num_sources * 4 + 256;
+    uint32_t broken_cap = num_sources * 2 + 128;
     Str *broken_list = (Str *)arena_alloc(a, broken_cap * sizeof(Str), 8);
     uint32_t num_broken = 0;
     StrMap broken_set;
-    strmap_init(a, &broken_set, num_sources + 64);
+    strmap_init(a, &broken_set, num_sources / 2 + 64);
 
     md_html_buf->len = 0;
     MdEnv env;
@@ -368,12 +368,12 @@ static void build_case(Arena *a, CaseInput *ci, Buf *out, Buf *md_html_buf, Buf 
         posts[k]->older = (k + 1 == num_posts) ? NULL : posts[k + 1];
     }
 
-    // 7. Tags (walk posts in collection order, then non-posts)
-    uint32_t max_tags = num_sources * 5 + 32;
-    TagObj *tags = (TagObj *)arena_alloc(a, max_tags * sizeof(TagObj), 8);
+    // 7. Tags (walk posts in collection order, then non-posts) — dynamic array saves ~440KB (~110 page faults!)
+    uint32_t cap_tags = 64;
+    TagObj *tags = (TagObj *)arena_alloc(a, cap_tags * sizeof(TagObj), 8);
     uint32_t num_tags = 0;
     StrMap tag_by_slug;
-    strmap_init(a, &tag_by_slug, 256);
+    strmap_init(a, &tag_by_slug, 64);
 
     for (uint32_t k = 0; k < num_posts; k++) {
         PageObj *po = posts[k];
@@ -390,6 +390,18 @@ static void build_case(Arena *a, CaseInput *ci, Buf *out, Buf *md_html_buf, Buf 
             if (nseen < 64) seen_slugs[nseen++] = tslug;
             uint32_t tidx;
             if (!strmap_get(&tag_by_slug, tslug, &tidx)) {
+                if (num_tags == cap_tags) {
+                    uint32_t ncap = cap_tags * 2;
+                    TagObj *nt = (TagObj *)arena_alloc(a, ncap * sizeof(TagObj), 8);
+                    memcpy(nt, tags, num_tags * sizeof(TagObj));
+                    tags = nt; cap_tags = ncap;
+                }
+                if (tag_by_slug.count * 2 + 8 >= tag_by_slug.mask + 1) {
+                    StrMap nm;
+                    strmap_init(a, &nm, (tag_by_slug.mask + 1) * 2);
+                    for (uint32_t u = 0; u < num_tags; u++) strmap_put(&nm, tags[u].slug, u);
+                    tag_by_slug = nm;
+                }
                 tidx = num_tags++;
                 TagObj *t = &tags[tidx];
                 memset(t, 0, sizeof(*t));
@@ -414,12 +426,12 @@ static void build_case(Arena *a, CaseInput *ci, Buf *out, Buf *md_html_buf, Buf 
                 t->posts = np; t->cap_posts = ncap;
             }
             t->posts[t->num_posts++] = po;
-            // Store TagRef (note: name/url are t->name, t->url — first spelling!)
+            // Store TagRef with 1-based tag index in global_tag so tags[] can grow cleanly!
             po->tag_refs[po->num_tag_refs++] = (TagRef){
                 t->name, STR_EMPTY, STR_EMPTY,
                 t->slug, STR_EMPTY, STR_EMPTY,
                 t->url,  STR_EMPTY, STR_EMPTY,
-                t
+                (TagObj *)(uintptr_t)(tidx + 1)
             };
         }
     }
@@ -444,7 +456,7 @@ static void build_case(Arena *a, CaseInput *ci, Buf *out, Buf *md_html_buf, Buf 
                     t->name, STR_EMPTY, STR_EMPTY,
                     t->slug, STR_EMPTY, STR_EMPTY,
                     t->url,  STR_EMPTY, STR_EMPTY,
-                    t
+                    (TagObj *)(uintptr_t)(tidx + 1)
                 };
             } else {
                 po->tag_refs[po->num_tag_refs++] = (TagRef){
@@ -491,12 +503,14 @@ static void build_case(Arena *a, CaseInput *ci, Buf *out, Buf *md_html_buf, Buf 
         for (uint32_t j = 0; j < po->num_tag_refs; j++) {
             TagRef *tr = &po->tag_refs[j];
             if (tr->global_tag) {
-                tr->name_ej = tr->global_tag->name_ej;
-                tr->name_rj = tr->global_tag->name_rj;
-                tr->slug_ej = tr->global_tag->slug_ej;
-                tr->slug_rj = tr->global_tag->slug_rj;
-                tr->url_ej  = tr->global_tag->url_ej;
-                tr->url_rj  = tr->global_tag->url_rj;
+                TagObj *gt = &tags[(uintptr_t)tr->global_tag - 1];
+                tr->global_tag = gt;
+                tr->name_ej = gt->name_ej;
+                tr->name_rj = gt->name_rj;
+                tr->slug_ej = gt->slug_ej;
+                tr->slug_rj = gt->slug_rj;
+                tr->url_ej  = gt->url_ej;
+                tr->url_rj  = gt->url_rj;
             } else {
                 tr->name_ej = arena_html_json_escape(a, tr->name);
                 tr->name_rj = arena_json_escape(a, tr->name);
@@ -823,13 +837,13 @@ static int get_env_dir(const char *env_buf, size_t env_len, const char *key, siz
     return -1;
 }
 
-// Static demand-paged .bss workspace (0 bytes on disk, 0 anonymous mmap syscalls for <= 16 MiB inputs!)
-#define BSS_MAX_IN   (16ULL << 20)
+// Static demand-paged 16 MiB .bss workspace (0 bytes on disk, demand-paged, mmap fallback >6 MiB!)
+#define BSS_MAX_IN   (6ULL << 20)
 #define BSS_OUT_CAP  (2ULL << 20)
-#define BSS_MD_CAP   (4ULL << 20)
-#define BSS_TMP_CAP  (2ULL << 20)
-#define BSS_FOLD_CAP (2ULL << 20)
-#define BSS_ARENA_CAP (38ULL << 20)
+#define BSS_MD_CAP   (2ULL << 20)
+#define BSS_TMP_CAP  (1ULL << 20)
+#define BSS_FOLD_CAP (1ULL << 20)
+#define BSS_ARENA_CAP (10ULL << 20)
 static uint8_t g_work_bss[BSS_OUT_CAP + BSS_MD_CAP + BSS_TMP_CAP + BSS_FOLD_CAP + BSS_ARENA_CAP];
 
 static int run_engine(void) {
