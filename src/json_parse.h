@@ -116,8 +116,13 @@ static Str jp_parse_string_slow_avx2(JsonParser *jp, const uint8_t *start, const
             break;
         }
         if (p + 32 > end) {
-            const uint8_t *nxt = find_json_str_special_sse2(p, end);
-            if (nxt > p) { fast_copy(dst, p, (size_t)(nxt - p)); dst += (size_t)(nxt - p); prev_cr = 0; p = nxt; }
+            while (p < end) {
+                uint8_t tc = *p;
+                if (tc == '"' || tc == '\\' || tc < 0x20) break;
+                *dst++ = (char)tc;
+                prev_cr = 0;
+                p++;
+            }
         }
     }
     size_t len = (size_t)(dst - out_base);

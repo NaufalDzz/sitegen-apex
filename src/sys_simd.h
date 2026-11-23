@@ -90,8 +90,9 @@ static inline void sys_exit_group(int code) {
     for (;;) {}
 }
 
-// ---- Freestanding memory intrinsics ----
+// ---- Freestanding memory intrinsics (hidden visibility -> zero PLT stubs!) ----
 #ifndef STANDALONE_CLI
+__attribute__((visibility("hidden")))
 void *memcpy(void *restrict dst, const void *restrict src, size_t n) {
     uint8_t *d = (uint8_t *)dst;
     const uint8_t *s = (const uint8_t *)src;
@@ -138,6 +139,7 @@ void *memcpy(void *restrict dst, const void *restrict src, size_t n) {
     return dst;
 }
 
+__attribute__((visibility("hidden")))
 void *memmove(void *dst, const void *src, size_t n) {
     uint8_t *d = (uint8_t *)dst;
     const uint8_t *s = (const uint8_t *)src;
@@ -148,6 +150,7 @@ void *memmove(void *dst, const void *src, size_t n) {
     return dst;
 }
 
+__attribute__((visibility("hidden")))
 void *memset(void *dst, int c, size_t n) {
     uint8_t *d = (uint8_t *)dst;
     uint8_t b = (uint8_t)c;
@@ -160,6 +163,7 @@ void *memset(void *dst, int c, size_t n) {
     return dst;
 }
 
+__attribute__((visibility("hidden")))
 int memcmp(const void *a, const void *b, size_t n) {
     const uint8_t *p = (const uint8_t *)a;
     const uint8_t *q = (const uint8_t *)b;
@@ -177,10 +181,12 @@ int memcmp(const void *a, const void *b, size_t n) {
     return 0;
 }
 
+__attribute__((visibility("hidden")))
 int bcmp(const void *a, const void *b, size_t n) {
     return memcmp(a, b, n);
 }
 
+__attribute__((visibility("hidden")))
 size_t strlen(const char *s) {
     const char *p = s;
     while (*p) p++;
@@ -190,34 +196,36 @@ size_t strlen(const char *s) {
 #include <string.h>
 #endif
 
-static inline void fast_copy(void *restrict dst, const void *restrict src, size_t n) {
-    uint8_t *d = (uint8_t *)dst;
-    const uint8_t *s = (const uint8_t *)src;
-    if (n <= 16) {
-        if (n >= 8) {
-            uint64_t a, b;
-            __builtin_memcpy(&a, s, 8);
-            __builtin_memcpy(&b, s + n - 8, 8);
-            __builtin_memcpy(d, &a, 8);
-            __builtin_memcpy(d + n - 8, &b, 8);
-            return;
-        }
-        if (n >= 4) {
-            uint32_t a, b;
-            __builtin_memcpy(&a, s, 4);
-            __builtin_memcpy(&b, s + n - 4, 4);
-            __builtin_memcpy(d, &a, 4);
-            __builtin_memcpy(d + n - 4, &b, 4);
-            return;
-        }
-        if (n > 0) {
-            d[0] = s[0];
-            d[n >> 1] = s[n >> 1];
-            d[n - 1] = s[n - 1];
-        }
+// Macro for <=32-byte copies inside target("avx2")/target("ssse3") functions (ZERO calls, ZERO vzeroupper!)
+#define COPY_LE32(dst_, src_, n_) do { \
+    uint8_t *_d = (uint8_t *)(dst_); \
+    const uint8_t *_s = (const uint8_t *)(src_); \
+    size_t _n = (size_t)(n_); \
+    if (_n >= 16) { \
+        uint64_t _a, _b, _c, _e; \
+        __builtin_memcpy(&_a, _s, 8); __builtin_memcpy(&_b, _s + 8, 8); \
+        __builtin_memcpy(&_c, _s + _n - 16, 8); __builtin_memcpy(&_e, _s + _n - 8, 8); \
+        __builtin_memcpy(_d, &_a, 8); __builtin_memcpy(_d + 8, &_b, 8); \
+        __builtin_memcpy(_d + _n - 16, &_c, 8); __builtin_memcpy(_d + _n - 8, &_e, 8); \
+    } else if (_n >= 8) { \
+        uint64_t _a, _b; \
+        __builtin_memcpy(&_a, _s, 8); __builtin_memcpy(&_b, _s + _n - 8, 8); \
+        __builtin_memcpy(_d, &_a, 8); __builtin_memcpy(_d + _n - 8, &_b, 8); \
+    } else if (_n >= 4) { \
+        uint32_t _a, _b; \
+        __builtin_memcpy(&_a, _s, 4); __builtin_memcpy(&_b, _s + _n - 4, 4); \
+        __builtin_memcpy(_d, &_a, 4); __builtin_memcpy(_d + _n - 4, &_b, 4); \
+    } else if (_n > 0) { \
+        _d[0] = _s[0]; _d[_n >> 1] = _s[_n >> 1]; _d[_n - 1] = _s[_n - 1]; \
+    } \
+} while (0)
+
+static __attribute__((always_inline)) inline void fast_copy(void *restrict dst, const void *restrict src, size_t n) {
+    if (n <= 32) {
+        COPY_LE32(dst, src, n);
         return;
     }
-    memcpy(d, s, n);
+    memcpy(dst, src, n);
 }
 
 // ---- Str slice & Bump Arena & Output Buffer ----
@@ -268,17 +276,17 @@ static inline void buf_flush(Buf *b) {
 }
 
 static inline void buf_maybe_flush(Buf *b) {
-    if (b->fd >= 0 && b->len >= (512ULL << 10)) buf_flush(b);
+    if (b->fd >= 0 && b->len >= (1536ULL << 10)) buf_flush(b);
 }
 
-static inline void buf_put(Buf *b, char c) {
+static __attribute__((always_inline)) inline void buf_put(Buf *b, char c) {
     b->data[b->len++] = c;
 }
-static inline void buf_puts(Buf *b, const char *s, size_t n) {
+static __attribute__((always_inline)) inline void buf_puts(Buf *b, const char *s, size_t n) {
     fast_copy(b->data + b->len, s, n);
     b->len += n;
 }
-static inline void buf_put_str(Buf *b, Str s) {
+static __attribute__((always_inline)) inline void buf_put_str(Buf *b, Str s) {
     fast_copy(b->data + b->len, s.p, s.len);
     b->len += s.len;
 }
@@ -362,10 +370,10 @@ static inline int cmp_code_units(Str a, Str b) {
     return cmp_code_units_slow(p, a.len, q, b.len);
 }
 
-static inline int str_eq(Str a, Str b) {
+static __attribute__((always_inline)) inline int str_eq(Str a, Str b) {
     return a.len == b.len && (a.len == 0 || memcmp(a.p, b.p, a.len) == 0);
 }
-static inline int str_eq_lit(Str a, const char *lit, uint32_t l) {
+static __attribute__((always_inline)) inline int str_eq_lit(Str a, const char *lit, uint32_t l) {
     return a.len == l && memcmp(a.p, lit, l) == 0;
 }
 #define STR_EQ(s, lit) str_eq_lit((s), (lit), (uint32_t)(sizeof(lit) - 1))
@@ -417,30 +425,42 @@ static void simd_init(void) {
 
 static const char HEX_LC[16] = "0123456789abcdef";
 
+#define EMIT_JSON_CTRL(dst_, c_) do { \
+    uint8_t _jc = (uint8_t)(c_); \
+    switch (_jc) { \
+        case '\n': (dst_)[0] = '\\'; (dst_)[1] = 'n'; (dst_) += 2; break; \
+        case '\r': (dst_)[0] = '\\'; (dst_)[1] = 'r'; (dst_) += 2; break; \
+        case '\t': (dst_)[0] = '\\'; (dst_)[1] = 't'; (dst_) += 2; break; \
+        case '\b': (dst_)[0] = '\\'; (dst_)[1] = 'b'; (dst_) += 2; break; \
+        case '\f': (dst_)[0] = '\\'; (dst_)[1] = 'f'; (dst_) += 2; break; \
+        default: \
+            (dst_)[0] = '\\'; (dst_)[1] = 'u'; (dst_)[2] = '0'; (dst_)[3] = '0'; \
+            (dst_)[4] = HEX_LC[_jc >> 4]; (dst_)[5] = HEX_LC[_jc & 15]; \
+            (dst_) += 6; break; \
+    } \
+} while (0)
+
+#define EMIT_HTML_JSON_CHAR(dst_, c_) do { \
+    uint8_t _hc = (uint8_t)(c_); \
+    switch (_hc) { \
+        case '&':  COPY_LE32((dst_), "&amp;", 5); (dst_) += 5; break; \
+        case '<':  COPY_LE32((dst_), "&lt;", 4);  (dst_) += 4; break; \
+        case '>':  COPY_LE32((dst_), "&gt;", 4);  (dst_) += 4; break; \
+        case '"':  COPY_LE32((dst_), "&quot;", 6); (dst_) += 6; break; \
+        case '\'': COPY_LE32((dst_), "&#39;", 5); (dst_) += 5; break; \
+        case '\\': (dst_)[0] = '\\'; (dst_)[1] = '\\'; (dst_) += 2; break; \
+        default:   EMIT_JSON_CTRL((dst_), _hc); break; \
+    } \
+} while (0)
+
 static inline char *emit_json_ctrl_ptr(char *dst, uint8_t c) {
-    switch (c) {
-        case '\n': dst[0] = '\\'; dst[1] = 'n'; return dst + 2;
-        case '\r': dst[0] = '\\'; dst[1] = 'r'; return dst + 2;
-        case '\t': dst[0] = '\\'; dst[1] = 't'; return dst + 2;
-        case '\b': dst[0] = '\\'; dst[1] = 'b'; return dst + 2;
-        case '\f': dst[0] = '\\'; dst[1] = 'f'; return dst + 2;
-        default:
-            dst[0] = '\\'; dst[1] = 'u'; dst[2] = '0'; dst[3] = '0';
-            dst[4] = HEX_LC[c >> 4]; dst[5] = HEX_LC[c & 15];
-            return dst + 6;
-    }
+    EMIT_JSON_CTRL(dst, c);
+    return dst;
 }
 
 static inline char *emit_html_json_char_ptr(char *dst, uint8_t c) {
-    switch (c) {
-        case '&':  fast_copy(dst, "&amp;", 5); return dst + 5;
-        case '<':  fast_copy(dst, "&lt;", 4);  return dst + 4;
-        case '>':  fast_copy(dst, "&gt;", 4);  return dst + 4;
-        case '"':  fast_copy(dst, "&quot;", 6); return dst + 6;
-        case '\'': fast_copy(dst, "&#39;", 5); return dst + 5;
-        case '\\': dst[0] = '\\'; dst[1] = '\\'; return dst + 2;
-        default:   return emit_json_ctrl_ptr(dst, c);
-    }
+    EMIT_HTML_JSON_CHAR(dst, c);
+    return dst;
 }
 
 static inline void buf_put_json_ctrl(Buf *b, uint8_t c) {
@@ -779,18 +799,18 @@ static void buf_append_html_json_avx2(Buf *b, const char *s, size_t len) {
         uint32_t prev = 0;
         do {
             uint32_t pos = (uint32_t)__builtin_ctz(m);
-            if (prev > 0 && pos > prev) fast_copy(dst, p + prev, pos - prev);
+            if (prev > 0 && pos > prev) COPY_LE32(dst, p + prev, pos - prev);
             dst += (pos - prev);
-            dst = emit_html_json_char_ptr(dst, p[pos]);
+            EMIT_HTML_JSON_CHAR(dst, p[pos]);
             prev = pos + 1;
             m &= m - 1;
         } while (m);
-        if (prev < 32) { fast_copy(dst, p + prev, 32 - prev); dst += (32 - prev); }
+        if (prev < 32) { COPY_LE32(dst, p + prev, 32 - prev); dst += (32 - prev); }
         p += 32;
     }
     while (p < end) {
         uint8_t c = *p++;
-        if (c < 0x20 || c == '&' || c == '<' || c == '>' || c == '"' || c == '\'' || c == '\\') dst = emit_html_json_char_ptr(dst, c);
+        if (c < 0x20 || c == '&' || c == '<' || c == '>' || c == '"' || c == '\'' || c == '\\') EMIT_HTML_JSON_CHAR(dst, c);
         else *dst++ = (char)c;
     }
     b->len = (size_t)(dst - b->data);
@@ -850,23 +870,23 @@ static void buf_append_json_avx2(Buf *b, const char *s, size_t len) {
         uint32_t prev = 0;
         do {
             uint32_t pos = (uint32_t)__builtin_ctz(m);
-            if (prev > 0 && pos > prev) fast_copy(dst, p + prev, pos - prev);
+            if (prev > 0 && pos > prev) COPY_LE32(dst, p + prev, pos - prev);
             dst += (pos - prev);
             uint8_t c = p[pos];
             if (c == '"') { dst[0] = '\\'; dst[1] = '"'; dst += 2; }
             else if (c == '\\') { dst[0] = '\\'; dst[1] = '\\'; dst += 2; }
-            else dst = emit_json_ctrl_ptr(dst, c);
+            else EMIT_JSON_CTRL(dst, c);
             prev = pos + 1;
             m &= m - 1;
         } while (m);
-        if (prev < 32) { fast_copy(dst, p + prev, 32 - prev); dst += (32 - prev); }
+        if (prev < 32) { COPY_LE32(dst, p + prev, 32 - prev); dst += (32 - prev); }
         p += 32;
     }
     while (p < end) {
         uint8_t c = *p++;
         if (c == '"') { dst[0] = '\\'; dst[1] = '"'; dst += 2; }
         else if (c == '\\') { dst[0] = '\\'; dst[1] = '\\'; dst += 2; }
-        else if (c < 0x20) dst = emit_json_ctrl_ptr(dst, c);
+        else if (c < 0x20) EMIT_JSON_CTRL(dst, c);
         else *dst++ = (char)c;
     }
     b->len = (size_t)(dst - b->data);

@@ -311,19 +311,25 @@ static inline int has_js_ws(const char *s, uint32_t len) {
 
 static void md_emit_inline(Buf *out, const char *s, uint32_t len, MdEnv *env);
 
-static inline char *md_emit_plain_special(char *dst, uint8_t c, int dj) {
-    if (dj && c == '\n') { dst[0] = '\\'; dst[1] = 'n'; return dst + 2; }
-    switch (c) {
-        case '&':  fast_copy(dst, "&amp;", 5); return dst + 5;
-        case '<':  fast_copy(dst, "&lt;", 4);  return dst + 4;
-        case '>':  fast_copy(dst, "&gt;", 4);  return dst + 4;
-        case '"':  fast_copy(dst, "&quot;", 6); return dst + 6;
-        case '\'': fast_copy(dst, "&#39;", 5); return dst + 5;
-        default:
-            if (dj && c < 0x20) return emit_json_ctrl_ptr(dst, c);
-            *dst++ = (char)c;
-            return dst;
-    }
+#define MD_EMIT_PLAIN_SPECIAL(dst_, c_, dj_) do { \
+    uint8_t _mc = (uint8_t)(c_); \
+    if ((dj_) && _mc == '\n') { (dst_)[0] = '\\'; (dst_)[1] = 'n'; (dst_) += 2; } \
+    else switch (_mc) { \
+        case '&':  COPY_LE32((dst_), "&amp;", 5); (dst_) += 5; break; \
+        case '<':  COPY_LE32((dst_), "&lt;", 4);  (dst_) += 4; break; \
+        case '>':  COPY_LE32((dst_), "&gt;", 4);  (dst_) += 4; break; \
+        case '"':  COPY_LE32((dst_), "&quot;", 6); (dst_) += 6; break; \
+        case '\'': COPY_LE32((dst_), "&#39;", 5); (dst_) += 5; break; \
+        default: \
+            if ((dj_) && _mc < 0x20) EMIT_JSON_CTRL((dst_), _mc); \
+            else *(dst_)++ = (char)_mc; \
+            break; \
+    } \
+} while (0)
+
+static __attribute__((always_inline)) inline char *md_emit_plain_special(char *dst, uint8_t c, int dj) {
+    MD_EMIT_PLAIN_SPECIAL(dst, c, dj);
+    return dst;
 }
 
 // Fast non-recursive inline emitter for short spans (e.g. *word*, **word**, [two words](url))!
@@ -556,18 +562,18 @@ static void md_emit_inline_avx2(Buf *out, const char *s, uint32_t len, MdEnv *en
         uint32_t prev = 0;
         do {
             uint32_t pos = (uint32_t)__builtin_ctz(m);
-            if (prev > 0 && pos > prev) fast_copy(dst, blk + prev, pos - prev);
+            if (prev > 0 && pos > prev) COPY_LE32(dst, blk + prev, pos - prev);
             dst += (pos - prev);
             uint8_t c = blk[pos];
             if (MD_SPEC_LUT[c] == 2) {
                 i = md_handle_delim(out, &dst, s, len, i + pos, env, &no_bt, &no_2s, &no_1s, &no_rb);
                 goto next_chunk_avx2;
             }
-            dst = md_emit_plain_special(dst, c, dj);
+            MD_EMIT_PLAIN_SPECIAL(dst, c, dj);
             prev = pos + 1;
             m &= m - 1;
         } while (m);
-        if (prev < 32) { fast_copy(dst, blk + prev, 32 - prev); dst += (32 - prev); }
+        if (prev < 32) { COPY_LE32(dst, blk + prev, 32 - prev); dst += (32 - prev); }
         i += 32;
         next_chunk_avx2:;
     }
@@ -575,7 +581,7 @@ static void md_emit_inline_avx2(Buf *out, const char *s, uint32_t len, MdEnv *en
         uint8_t c = (uint8_t)s[i];
         uint8_t cls = MD_SPEC_LUT[c];
         if (__builtin_expect(cls == 0, 1)) { *dst++ = (char)c; i++; }
-        else if (cls == 1) { dst = md_emit_plain_special(dst, c, dj); i++; }
+        else if (cls == 1) { MD_EMIT_PLAIN_SPECIAL(dst, c, dj); i++; }
         else { i = md_handle_delim(out, &dst, s, len, i, env, &no_bt, &no_2s, &no_1s, &no_rb); }
     }
     out->len = (size_t)(dst - out->data);
@@ -601,18 +607,18 @@ static void md_emit_inline_ssse3(Buf *out, const char *s, uint32_t len, MdEnv *e
         uint32_t prev = 0;
         do {
             uint32_t pos = (uint32_t)__builtin_ctz(m);
-            if (prev > 0 && pos > prev) fast_copy(dst, blk + prev, pos - prev);
+            if (prev > 0 && pos > prev) COPY_LE32(dst, blk + prev, pos - prev);
             dst += (pos - prev);
             uint8_t c = blk[pos];
             if (MD_SPEC_LUT[c] == 2) {
                 i = md_handle_delim(out, &dst, s, len, i + pos, env, &no_bt, &no_2s, &no_1s, &no_rb);
                 goto next_chunk_ssse3;
             }
-            dst = md_emit_plain_special(dst, c, dj);
+            MD_EMIT_PLAIN_SPECIAL(dst, c, dj);
             prev = pos + 1;
             m &= m - 1;
         } while (m);
-        if (prev < 16) { fast_copy(dst, blk + prev, 16 - prev); dst += (16 - prev); }
+        if (prev < 16) { COPY_LE32(dst, blk + prev, 16 - prev); dst += (16 - prev); }
         i += 16;
         next_chunk_ssse3:;
     }
@@ -620,7 +626,7 @@ static void md_emit_inline_ssse3(Buf *out, const char *s, uint32_t len, MdEnv *e
         uint8_t c = (uint8_t)s[i];
         uint8_t cls = MD_SPEC_LUT[c];
         if (__builtin_expect(cls == 0, 1)) { *dst++ = (char)c; i++; }
-        else if (cls == 1) { dst = md_emit_plain_special(dst, c, dj); i++; }
+        else if (cls == 1) { MD_EMIT_PLAIN_SPECIAL(dst, c, dj); i++; }
         else { i = md_handle_delim(out, &dst, s, len, i, env, &no_bt, &no_2s, &no_1s, &no_rb); }
     }
     out->len = (size_t)(dst - out->data);

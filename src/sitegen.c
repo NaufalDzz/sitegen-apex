@@ -767,6 +767,7 @@ static void build_case(Arena *a, CaseInput *ci, Buf *out, Buf *md_html_buf, Buf 
 
     // 9e. Static files (check shadowing!)
     for (uint32_t i = 0; i < num_statics; i++) {
+        buf_maybe_flush(out);
         RawFile *sf = &statics[i];
         if (any_static_html && strmap_get(&output_keys, sf->path, NULL)) {
             if (num_report < rep_cap) {
@@ -939,7 +940,7 @@ static int run_engine(void) {
                 if (have_input) {
                     if (case_idx > 0) buf_put(&out, ',');
                     build_case(&arena, &ci, &out, &md_html, &md_tmp, &fold_b);
-                    buf_flush(&out); // Flush per case -> keeps peak output RAM <= 512 KiB!
+                    buf_maybe_flush(&out);
                     case_idx++;
                 }
             }

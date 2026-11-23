@@ -9,7 +9,7 @@ Dual-architecture freestanding zero-libc C11 + SIMD (`AVX2`/`SSSE3`/`SSE2` + `NE
 ## Architecture
 - **`package.json` + `main.ts`**: Zero-ESM CommonJS (`"type":"commonjs"`) 1-line launcher directly loading the native freestanding binary (`x.node` on `x64`, `a.node` on `arm64`) via `process.dlopen`.
 - **`x.node` / `a.node`** (built from `src/sitegen.c`):
-  - Zero-libc, zero-dynsym freestanding shared objects (`DT_NEEDED` empty, `DT_INIT_ARRAY` constructor runs inside `dlopen` before `dlsym` or N-API registration) using zero-copy `mmap` input reading, a static demand-paged `.bss` workspace, L2-hot 512 KiB output streaming, and direct `SYS_exit_group(0)` exit without V8 teardown overhead.
+  - Zero-libc, zero-PLT, zero-dynsym freestanding shared objects (`DT_NEEDED` empty, `-Bsymbolic`, `DT_INIT_ARRAY` constructor runs inside `dlopen` before `dlsym` or N-API registration) using zero-copy `mmap` input reading, a static demand-paged `.bss` workspace, 1.5 MiB batched output streaming, and direct `SYS_exit_group(0)` exit without V8 teardown overhead.
   - Streaming per-page Markdown rendering (`md_html` reset per page after pre-rendering only `recent` posts) keeping rendered HTML hot in L1 cache and minimizing page faults.
   - Runtime-dispatched `AVX2` / `SSSE3` / `SSE2` (on `x86_64`) and `NEON` (on `aarch64`) 3-instruction nibble-LUT SIMD scanners for 32-byte speculative-store JSON string unescaping + `\r\n` normalization, single-pass Markdown inline + HTML + JSON escaping, SIMD word counting, and newline scanning.
   - Single-pass direct JSON-escaped HTML emission (eliminating any secondary JSON serialization pass over rendered HTML).
