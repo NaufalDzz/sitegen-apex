@@ -503,7 +503,7 @@ static void md_emit_inline(Buf *out, const char *s, uint32_t len, MdEnv *env) {
                 if (prev > 0 && pos > prev) fast_copy(dst, blk + prev, pos - prev);
                 dst += (pos - prev);
                 uint8_t c = blk[pos];
-                if (c == '*' || c == '[' || c == '`' || c == '\\') {
+                if (MD_SPEC_LUT[c] == 2) {
                     i = md_handle_delim(out, &dst, s, len, i + pos, env, &no_bt, &no_2s, &no_1s, &no_rb);
                     goto next_chunk;
                 }
@@ -559,7 +559,7 @@ static void md_emit_inline_avx2(Buf *out, const char *s, uint32_t len, MdEnv *en
             if (prev > 0 && pos > prev) fast_copy(dst, blk + prev, pos - prev);
             dst += (pos - prev);
             uint8_t c = blk[pos];
-            if (c == '*' || c == '[' || c == '`' || c == '\\') {
+            if (MD_SPEC_LUT[c] == 2) {
                 i = md_handle_delim(out, &dst, s, len, i + pos, env, &no_bt, &no_2s, &no_1s, &no_rb);
                 goto next_chunk_avx2;
             }
@@ -604,7 +604,7 @@ static void md_emit_inline_ssse3(Buf *out, const char *s, uint32_t len, MdEnv *e
             if (prev > 0 && pos > prev) fast_copy(dst, blk + prev, pos - prev);
             dst += (pos - prev);
             uint8_t c = blk[pos];
-            if (c == '*' || c == '[' || c == '`' || c == '\\') {
+            if (MD_SPEC_LUT[c] == 2) {
                 i = md_handle_delim(out, &dst, s, len, i + pos, env, &no_bt, &no_2s, &no_1s, &no_rb);
                 goto next_chunk_ssse3;
             }
@@ -652,7 +652,7 @@ static void md_emit_inline_sse2(Buf *out, const char *s, uint32_t len, MdEnv *en
             if (prev > 0 && pos > prev) fast_copy(dst, blk + prev, pos - prev);
             dst += (pos - prev);
             uint8_t c = blk[pos];
-            if (c == '*' || c == '[' || c == '`' || c == '\\') {
+            if (MD_SPEC_LUT[c] == 2) {
                 i = md_handle_delim(out, &dst, s, len, i + pos, env, &no_bt, &no_2s, &no_1s, &no_rb);
                 goto next_chunk_sse2;
             }

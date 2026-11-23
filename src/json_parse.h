@@ -46,6 +46,87 @@ static inline size_t encode_utf8(char *dst, uint32_t cp) {
 }
 
 // Ultra-fast speculative-store SIMD JSON string parser with fused \r\n -> \n normalization!
+#if defined(__x86_64__)
+__attribute__((target("avx2")))
+static Str jp_parse_string_slow_avx2(JsonParser *jp, const uint8_t *start, const uint8_t *q, int normalize_cr) {
+    const uint8_t *end = jp->end;
+    char *out_base = arena_alloc_str(jp->arena, 0);
+    char *dst = out_base;
+    if (q > start) {
+        fast_copy(dst, start, (size_t)(q - start));
+        dst += (size_t)(q - start);
+    }
+    const uint8_t *p = q;
+    int prev_cr = 0;
+    __m256i vq = _mm256_set1_epi8('"'), vb = _mm256_set1_epi8('\\');
+    __m256i vc = _mm256_set1_epi8(0x20), vz = _mm256_setzero_si256();
+    while (p < end) {
+        uint8_t c = *p++;
+        if (c == '"') break;
+        if (c == '\\' && p < end) {
+            uint8_t e = *p++;
+            if (__builtin_expect(e == 'n', 1)) {
+                if (normalize_cr && prev_cr) prev_cr = 0;
+                else { *dst++ = '\n'; prev_cr = 0; }
+            } else if (e == '"') {
+                *dst++ = '"'; prev_cr = 0;
+            } else if (e == 'r') {
+                if (normalize_cr) { *dst++ = '\n'; prev_cr = 1; }
+                else *dst++ = '\r';
+            } else if (e == '\\') {
+                *dst++ = '\\'; prev_cr = 0;
+            } else if (e == 't') {
+                *dst++ = '\t'; prev_cr = 0;
+            } else if (e == '/') {
+                *dst++ = '/'; prev_cr = 0;
+            } else if (e == 'b') {
+                *dst++ = '\b'; prev_cr = 0;
+            } else if (e == 'f') {
+                *dst++ = '\f'; prev_cr = 0;
+            } else if (e == 'u' && p + 4 <= end) {
+                uint32_t cp = parse_hex4(p);
+                p += 4;
+                if (cp >= 0xD800 && cp <= 0xDBFF && p + 6 <= end && p[0] == '\\' && p[1] == 'u') {
+                    uint32_t lo = parse_hex4(p + 2);
+                    if (lo >= 0xDC00 && lo <= 0xDFFF) {
+                        cp = 0x10000 + (((cp - 0xD800) << 10) | (lo - 0xDC00));
+                        p += 6;
+                    }
+                }
+                if (normalize_cr && cp == '\r') { *dst++ = '\n'; prev_cr = 1; }
+                else if (normalize_cr && cp == '\n' && prev_cr) prev_cr = 0;
+                else { dst += encode_utf8(dst, cp); prev_cr = 0; }
+            } else {
+                *dst++ = (char)e; prev_cr = 0;
+            }
+        } else {
+            if (normalize_cr && c == '\r') { *dst++ = '\n'; prev_cr = 1; }
+            else if (normalize_cr && c == '\n' && prev_cr) prev_cr = 0;
+            else { *dst++ = (char)c; prev_cr = 0; }
+        }
+        while (p + 32 <= end) {
+            __m256i v = _mm256_loadu_si256((const __m256i *)p);
+            _mm256_storeu_si256((__m256i *)dst, v);
+            __m256i lt20 = _mm256_andnot_si256(_mm256_cmpgt_epi8(vz, v), _mm256_cmpgt_epi8(vc, v));
+            __m256i hit = _mm256_or_si256(_mm256_or_si256(_mm256_cmpeq_epi8(v, vq), _mm256_cmpeq_epi8(v, vb)), lt20);
+            uint32_t m = (uint32_t)_mm256_movemask_epi8(hit);
+            if (!m) { p += 32; dst += 32; prev_cr = 0; continue; }
+            uint32_t pos = (uint32_t)__builtin_ctz(m);
+            if (pos > 0) { p += pos; dst += pos; prev_cr = 0; }
+            break;
+        }
+        if (p + 32 > end) {
+            const uint8_t *nxt = find_json_str_special_sse2(p, end);
+            if (nxt > p) { fast_copy(dst, p, (size_t)(nxt - p)); dst += (size_t)(nxt - p); prev_cr = 0; p = nxt; }
+        }
+    }
+    size_t len = (size_t)(dst - out_base);
+    jp->arena->pos += len;
+    jp->p = p;
+    return (Str){ out_base, (uint32_t)len };
+}
+#endif
+
 static Str jp_parse_string(JsonParser *jp, int normalize_cr) {
     jp_skip_ws(jp);
     const uint8_t *p = jp->p;
@@ -59,6 +140,9 @@ static Str jp_parse_string(JsonParser *jp, int normalize_cr) {
         jp->p = q + 1;
         return (Str){ (const char *)start, (uint32_t)(q - start) };
     }
+#if defined(__x86_64__)
+    if (g_simd_level >= 2) return jp_parse_string_slow_avx2(jp, start, q, normalize_cr);
+#endif
     char *out_base = arena_alloc_str(jp->arena, 0);
     char *dst = out_base;
     if (q > start) {
@@ -72,6 +156,9 @@ static Str jp_parse_string(JsonParser *jp, int normalize_cr) {
     uint8x16_t vq = vdupq_n_u8('"');
     uint8x16_t vb = vdupq_n_u8('\\');
     uint8x16_t vc = vdupq_n_u8(0x20);
+#elif defined(__x86_64__)
+    __m128i xq = _mm_set1_epi8('"'), xb = _mm_set1_epi8('\\');
+    __m128i xc = _mm_set1_epi8(0x20), xz = _mm_setzero_si128();
 #endif
 
     while (p < end) {
@@ -79,7 +166,7 @@ static Str jp_parse_string(JsonParser *jp, int normalize_cr) {
         if (c == '"') break;
         if (c == '\\' && p < end) {
             uint8_t e = *p++;
-            if (e == 'n') {
+            if (__builtin_expect(e == 'n', 1)) {
                 if (normalize_cr && prev_cr) prev_cr = 0;
                 else { *dst++ = '\n'; prev_cr = 0; }
             } else if (e == '"') {
@@ -135,24 +222,20 @@ static Str jp_parse_string(JsonParser *jp, int normalize_cr) {
             if (nxt > p) { fast_copy(dst, p, (size_t)(nxt - p)); dst += (size_t)(nxt - p); prev_cr = 0; p = nxt; }
         }
 #elif defined(__x86_64__)
-        {
-            __m128i xq = _mm_set1_epi8('"'), xb = _mm_set1_epi8('\\');
-            __m128i xc = _mm_set1_epi8(0x20), xz = _mm_setzero_si128();
-            while (p + 16 <= end) {
-                __m128i v = _mm_loadu_si128((const __m128i *)p);
-                _mm_storeu_si128((__m128i *)dst, v);
-                __m128i lt20 = _mm_andnot_si128(_mm_cmplt_epi8(v, xz), _mm_cmplt_epi8(v, xc));
-                __m128i hit = _mm_or_si128(_mm_or_si128(_mm_cmpeq_epi8(v, xq), _mm_cmpeq_epi8(v, xb)), lt20);
-                uint32_t m = (uint32_t)_mm_movemask_epi8(hit);
-                if (!m) { p += 16; dst += 16; prev_cr = 0; continue; }
-                uint32_t pos = (uint32_t)__builtin_ctz(m);
-                if (pos > 0) { p += pos; dst += pos; prev_cr = 0; }
-                break;
-            }
-            if (p + 16 > end) {
-                const uint8_t *nxt = find_json_str_special(p, end);
-                if (nxt > p) { fast_copy(dst, p, (size_t)(nxt - p)); dst += (size_t)(nxt - p); prev_cr = 0; p = nxt; }
-            }
+        while (p + 16 <= end) {
+            __m128i v = _mm_loadu_si128((const __m128i *)p);
+            _mm_storeu_si128((__m128i *)dst, v);
+            __m128i lt20 = _mm_andnot_si128(_mm_cmplt_epi8(v, xz), _mm_cmplt_epi8(v, xc));
+            __m128i hit = _mm_or_si128(_mm_or_si128(_mm_cmpeq_epi8(v, xq), _mm_cmpeq_epi8(v, xb)), lt20);
+            uint32_t m = (uint32_t)_mm_movemask_epi8(hit);
+            if (!m) { p += 16; dst += 16; prev_cr = 0; continue; }
+            uint32_t pos = (uint32_t)__builtin_ctz(m);
+            if (pos > 0) { p += pos; dst += pos; prev_cr = 0; }
+            break;
+        }
+        if (p + 16 > end) {
+            const uint8_t *nxt = find_json_str_special_sse2(p, end);
+            if (nxt > p) { fast_copy(dst, p, (size_t)(nxt - p)); dst += (size_t)(nxt - p); prev_cr = 0; p = nxt; }
         }
 #else
         const uint8_t *nxt = find_json_str_special(p, end);
